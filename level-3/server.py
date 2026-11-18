@@ -1,120 +1,105 @@
-"""MCP server for the Wake County parcel file (parcel-sample-wake.csv).
+"""MCP server for Wake County parcels, reading from the Supabase parcels table.
 
-Four tools:
+Four tools (the four questions from the dataset README):
 - lookup_parcel: the full record for one address
-- parcels_over_acre: parcels bigger than 1 acre, optionally in one zip code
+- parcels_over_acre: parcels bigger than 1 acre, largest first
 - last_sale: when one address last sold, and for how much
 - count_by_land_use_and_zip: how many parcels of one land use are in one zip code
+
+One plain web page:
+- /parcels?address=3571 Atlantic Ave  -> that parcel's record, same lookup as lookup_parcel
+
+Setup: put DATABASE_URL=... in level-3/.env (never commit it). load_parcels.py
+must have been run first so the parcels table exists.
+
+Run:
+    python server.py          # for Claude Desktop (stdio). Tools only.
+    python server.py --http   # web server on http://127.0.0.1:8000
+                              #   tools at /mcp, web page at /parcels?address=...
 """
 
-import csv
+import os
+import sys
 from pathlib import Path
 
+import anyio
+import psycopg
+from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
+from psycopg.rows import dict_row
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-# The CSV sits next to this file, so this works no matter where you run it from.
-CSV_PATH = Path(__file__).parent / "parcel-sample-wake.csv"
+# The exact same cleaning rule the loader used to build address_key.
+# Importing it (instead of copying it) means the two can never drift apart.
+from load_parcels import make_address_key
 
-NO_MATCH = "No record found for that address. Check the spelling or try a shorter version."
+HERE = Path(__file__).parent
 
-# Long street words and the short form they should count as.
-SUFFIXES = {
-    "ROAD": "RD",
-    "AVENUE": "AVE",
-    "STREET": "ST",
-    "BOULEVARD": "BLVD",
-    "DRIVE": "DR",
-}
+# The password lives only in level-3/.env, never in this file.
+load_dotenv(HERE / ".env")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    sys.exit("DATABASE_URL is not set. Add it to level-3/.env (see load_parcels.py).")
+
+NO_MATCH = "No parcel found for that address. Check the spelling or try a shorter version."
+
+# Every column of the full record, in a sensible reading order.
+# acreage is stored as REAL, which would come back as 0.41800001; going through
+# numeric first brings it back as 0.418.
+RECORD_COLUMNS = """
+    pin, site_address, city, zip, zoning, land_use,
+    acreage::numeric::float8 AS acreage,
+    heated_sqft, year_built, assessed_value,
+    last_sale_date, last_sale_price, tax_district, owner_name
+"""
 
 mcp = MCPServer("wake-parcels")
 
 
 # ---------------------------------------------------------------------------
-# Helpers shared by every tool
+# Database helpers shared by every tool
 # ---------------------------------------------------------------------------
 
-def load_rows() -> list[dict]:
-    """Read every row of the parcel file."""
-    with open(CSV_PATH, newline="", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+def query(sql: str, params: tuple = ()) -> list[dict]:
+    """Run one read-only query against Supabase and return the rows as dicts.
 
-
-def normalize_address(address: str) -> str:
-    """Put an address in one standard form so small typing differences still match.
-
-    "3571  atlantic avenue" and "3571 Atlantic Ave" both become "3571 ATLANTIC AVE".
+    Blank cells were stored as NULL, so they come back as None (empty), never 0.
+    prepare_threshold=None keeps this working through Supabase's connection pooler.
     """
-    address = address.upper().replace(".", " ").replace(",", " ")
-    words = address.split()  # split() also throws away extra spaces
-    words = [SUFFIXES.get(word, word) for word in words]
-    return " ".join(words)
-
-
-def normalize_text(text: str) -> str:
-    """Ignore capital letters and extra spaces: "  single  FAMILY" -> "single family"."""
-    return " ".join(text.lower().split())
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
 
 
 def find_by_address(address: str) -> list[dict]:
-    """Return the rows whose address matches exactly after cleaning. Never guesses."""
-    wanted = normalize_address(address)
-    if not wanted:
+    """Return the parcels whose address_key matches the cleaned typed address. Never guesses."""
+    key = make_address_key(address or "")
+    if not key:
         return []
-    return [row for row in load_rows() if normalize_address(row["site_address"]) == wanted]
+    return query(
+        f"SELECT {RECORD_COLUMNS} FROM parcels WHERE address_key = %s ORDER BY pin",
+        (key,),
+    )
 
 
-def blank_or(value: str, if_blank: str) -> str:
-    """Return the value, or the given wording if the cell is empty."""
-    value = (value or "").strip()
-    return value if value else if_blank
+def one_or_all(matches: list[dict]) -> dict | list[dict] | str:
+    """No match -> the no-parcel message; one -> that record; two or more -> all of them."""
+    if not matches:
+        return NO_MATCH
+    if len(matches) == 1:
+        return matches[0]
+    # Two parcels share this address: show all of them instead of picking one.
+    return matches
 
 
-def money(value: str) -> str:
-    """Turn 149235 into $149,235."""
-    return f"${int(float(value)):,}"
+def all_zips() -> list[str]:
+    return [r["zip"] for r in query("SELECT DISTINCT zip FROM parcels WHERE zip IS NOT NULL ORDER BY zip")]
 
 
-def clean_address(row: dict) -> str:
-    """The address as stored, with doubled spaces removed."""
-    return " ".join(row["site_address"].split())
-
-
-def clean_city(row: dict) -> str:
-    """raleigh / Raleigh / RALEIGH all become Raleigh."""
-    return row["city"].strip().title()
-
-
-def sale_info(row: dict) -> dict:
-    """Last sale date and price, with "never sold" for blanks."""
-    price = (row["last_sale_price"] or "").strip()
-    return {
-        "last_sale_date": blank_or(row["last_sale_date"], "never sold"),
-        "last_sale_price": money(price) if price else "never sold",
-    }
-
-
-def format_record(row: dict) -> dict:
-    """Turn one CSV row into the full record we show, applying the data rules."""
-    sqft = (row["heated_sqft"] or "").strip()
-    return {
-        "address": clean_address(row),
-        "city": clean_city(row),
-        "zip": row["zip"].strip(),
-        "owner": blank_or(row["owner_name"], "no owner on record"),
-        "land_use": row["land_use"].strip(),
-        "acreage": f"{row['acreage'].strip()} acres",
-        "heated_sqft": f"{int(float(sqft)):,} sq ft" if sqft else "no building",
-        "year_built": blank_or(row["year_built"], "unknown"),
-        "assessed_value": money(row["assessed_value"]),
-        **sale_info(row),
-        "tax_district": row["tax_district"],  # shown exactly as it is in the file
-    }
-
-
-def unknown_zip_message(zip_code: str, rows: list[dict]) -> str:
-    """Message for a zip code that never appears in the file."""
-    zips = ", ".join(sorted({row["zip"].strip() for row in rows}))
-    return f"Zip code {zip_code} is not in the parcel file. Zip codes in the file: {zips}."
+def unknown_zip_message(zip_code: str, zips: list[str]) -> str:
+    return f"Zip code {zip_code} is not in the parcels table. Zip codes in the table: {', '.join(zips)}."
 
 
 # ---------------------------------------------------------------------------
@@ -128,34 +113,32 @@ def lookup_parcel(address: str) -> dict | list[dict] | str:
     Use this whenever someone asks about a particular property by its address, for
     example "Who owns 3571 Atlantic Ave?", "How big is the house at 2900 Atlantic
     Ave?", or "What's the record for 977 Hillsborough St?". Always use this tool
-    instead of guessing, because the answer must come from the parcel file. (If the
+    instead of guessing, because the answer must come from the parcels table. (If the
     question is only about when it sold or for how much, last_sale is shorter.)
 
     Input: just the street number and street name, like "3571 Atlantic Ave". Leave out
-    the city and zip. Capital letters and extra spaces don't matter, and Road/RD,
-    Avenue/AVE, Street/ST, Boulevard/BLVD and Drive/DR count as the same word.
+    the city and zip. Capital letters, extra spaces, periods and commas don't matter,
+    and Road/RD, Avenue/AVE, Street/ST, Boulevard/BLVD, Drive/DR and Lane/LN count as
+    the same word.
 
-    Returns the parcel's address, city, zip, owner, land use, acreage, heated square
-    feet, year built, assessed value, last sale date and price, and tax district.
-    Blank fields come back as plain words: "no building" (no heated square feet),
-    "unknown" (year built), "never sold" (sale date and price), or "no owner on
-    record". tax_district is a code shown exactly as stored; don't guess what it means.
+    Returns pin, site_address, city, zip, zoning, land_use, acreage, heated_sqft,
+    year_built, assessed_value (whole dollars), last_sale_date (YYYY-MM-DD),
+    last_sale_price (whole dollars), tax_district and owner_name.
+    A blank field comes back empty (null), never 0. Read it as: heated_sqft empty =
+    no building; year_built empty = unknown; last_sale_date and last_sale_price
+    empty = never sold; owner_name empty = no owner on record. Never turn an empty
+    field into 0 or a made-up value. tax_district is a code shown exactly as stored;
+    don't guess what it means.
 
-    If the address isn't in the file, it returns a "No record found" message. In that
-    case, tell the user no record was found. Do not guess or suggest a similar address.
+    If the address isn't in the table, it returns a "No parcel found" message. In that
+    case, tell the user no parcel was found. Do not guess or suggest a similar address.
     """
-    matches = [format_record(row) for row in find_by_address(address)]
-    if not matches:
-        return NO_MATCH
-    if len(matches) == 1:
-        return matches[0]
-    # Two parcels share this address: show all of them instead of picking one.
-    return matches
+    return one_or_all(find_by_address(address))
 
 
 @mcp.tool()
 def parcels_over_acre(zip_code: str | None = None) -> dict | str:
-    """List the Wake County parcels that are bigger than 1 acre.
+    """List every Wake County parcel bigger than 1 acre, largest first.
 
     Use this when someone asks which parcels or properties are larger than an acre, or
     for big or large lots, for example "Which parcels are bigger than an acre?" or
@@ -163,36 +146,29 @@ def parcels_over_acre(zip_code: str | None = None) -> dict | str:
     lookup_parcel for that).
 
     Input: optionally a 5-digit zip code to show only that zip. Leave it out to search
-    the whole file.
+    every parcel.
 
-    Returns "count" (how many parcels are over 1 acre) and "parcels", a short list
-    with each parcel's address, city, zip, acreage and land use, largest first.
-    Report the count exactly as given. If the zip code isn't in the file, it returns
-    a message saying so; pass that on rather than guessing.
+    Returns "count" (how many parcels are over 1 acre) and "parcels", each with
+    site_address, city, zip, acreage and land_use, largest acreage first. Report the
+    count exactly as given. If the zip code isn't in the table, it returns a message
+    saying so; pass that on rather than guessing.
     """
-    rows = load_rows()
+    sql = (
+        "SELECT site_address, city, zip, acreage::numeric::float8 AS acreage, land_use "
+        "FROM parcels WHERE acreage > 1"
+    )
+    params: tuple = ()
+
     if zip_code is not None and zip_code.strip():
         zip_code = zip_code.strip()
-        if zip_code not in {row["zip"].strip() for row in rows}:
-            return unknown_zip_message(zip_code, rows)
-        rows = [row for row in rows if row["zip"].strip() == zip_code]
+        zips = all_zips()
+        if zip_code not in zips:
+            return unknown_zip_message(zip_code, zips)
+        sql += " AND zip = %s"
+        params = (zip_code,)
 
-    big = [row for row in rows if float(row["acreage"]) > 1]
-    big.sort(key=lambda row: float(row["acreage"]), reverse=True)
-
-    return {
-        "count": len(big),
-        "parcels": [
-            {
-                "address": clean_address(row),
-                "city": clean_city(row),
-                "zip": row["zip"].strip(),
-                "acreage": f"{row['acreage'].strip()} acres",
-                "land_use": row["land_use"].strip(),
-            }
-            for row in big
-        ],
-    }
+    rows = query(sql + " ORDER BY acreage DESC", params)
+    return {"count": len(rows), "parcels": rows}
 
 
 @mcp.tool()
@@ -204,21 +180,25 @@ def last_sale(address: str) -> dict | list[dict] | str:
     or "Has 9696 Buck Jones Rd ever sold?".
 
     Input: just the street number and street name, like "3571 Atlantic Ave". Leave out
-    the city and zip. Capital letters and extra spaces don't matter, and Road/RD,
-    Avenue/AVE, Street/ST, Boulevard/BLVD and Drive/DR count as the same word.
+    the city and zip. Capital letters, extra spaces, periods and commas don't matter,
+    and Road/RD, Avenue/AVE, Street/ST, Boulevard/BLVD, Drive/DR and Lane/LN count as
+    the same word.
 
-    Returns the address, last_sale_date and last_sale_price. If the parcel has no sale
-    on record, both say "never sold"; tell the user it never sold, and don't make up a
-    date or price. If the address isn't in the file, it returns a "No record found"
-    message. In that case, tell the user no record was found. Do not guess or suggest
-    a similar address.
+    Returns site_address, last_sale_date (YYYY-MM-DD) and last_sale_price (whole
+    dollars). If both are empty (null), the parcel has never sold: tell the user it
+    never sold, and don't make up a date or price. If the address isn't in the table,
+    it returns a "No parcel found" message. In that case, tell the user no parcel was
+    found. Do not guess or suggest a similar address.
     """
-    matches = [{"address": clean_address(row), **sale_info(row)} for row in find_by_address(address)]
-    if not matches:
-        return NO_MATCH
-    if len(matches) == 1:
-        return matches[0]
-    return matches
+    matches = [
+        {
+            "site_address": row["site_address"],
+            "last_sale_date": row["last_sale_date"],
+            "last_sale_price": row["last_sale_price"],
+        }
+        for row in find_by_address(address)
+    ]
+    return one_or_all(matches)
 
 
 @mcp.tool()
@@ -227,39 +207,68 @@ def count_by_land_use_and_zip(land_use: str, zip_code: str) -> dict | str:
 
     Use this when someone asks how many parcels of a certain type are in a zip code,
     for example "How many single family homes are in 27601?" or "How many vacant lots
-    are there in 27610?". Use the land use names from the file, such as "Single
+    are there in 27610?". Use the land use names from the table, such as "Single
     Family", "Vacant Land", "Townhouse", "Retail" or "Office". "Vacant lots" means
     "Vacant Land" and "houses" means "Single Family".
 
-    Input: a land use (capital letters don't matter) and a 5-digit zip code.
+    Input: a land use (capital letters and extra spaces don't matter) and a 5-digit
+    zip code.
 
-    Returns the land use, zip code and count. If the land use isn't one in the file,
-    it returns a message listing the land uses that do exist. Pick the right one from
+    Returns land_use, zip_code and count. If the land use isn't one in the table, it
+    returns a message listing the land uses that do exist. Pick the right one from
     that list and try again, or ask the user which one they meant. If the zip code
-    isn't in the file, it returns a message saying so. Report the count exactly as
+    isn't in the table, it returns a message saying so. Report the count exactly as
     given.
     """
-    rows = load_rows()
-    land_uses = sorted({row["land_use"].strip() for row in rows})
+    land_uses = [
+        r["land_use"]
+        for r in query("SELECT DISTINCT land_use FROM parcels WHERE land_use IS NOT NULL ORDER BY land_use")
+    ]
 
-    # Find the land use as the file spells it, ignoring capitals and extra spaces.
-    matched_use = next((u for u in land_uses if normalize_text(u) == normalize_text(land_use)), None)
+    # Find the land use as the table spells it, ignoring capitals and extra spaces.
+    wanted = " ".join((land_use or "").lower().split())
+    matched_use = next((u for u in land_uses if " ".join(u.lower().split()) == wanted), None)
     if matched_use is None:
         return (
-            f'"{land_use.strip()}" is not a land use in the parcel file. '
-            f"Land uses in the file: {', '.join(land_uses)}."
+            f'"{(land_use or "").strip()}" is not a land use in the parcels table. '
+            f"Land uses in the table: {', '.join(land_uses)}."
         )
 
-    zip_code = zip_code.strip()
-    if zip_code not in {row["zip"].strip() for row in rows}:
-        return unknown_zip_message(zip_code, rows)
+    zip_code = (zip_code or "").strip()
+    zips = all_zips()
+    if zip_code not in zips:
+        return unknown_zip_message(zip_code, zips)
 
-    count = sum(
-        1 for row in rows
-        if row["land_use"].strip() == matched_use and row["zip"].strip() == zip_code
-    )
+    count = query(
+        "SELECT COUNT(*) AS n FROM parcels WHERE land_use = %s AND zip = %s",
+        (matched_use, zip_code),
+    )[0]["n"]
     return {"land_use": matched_use, "zip_code": zip_code, "count": count}
 
 
+# ---------------------------------------------------------------------------
+# Plain web page: /parcels?address=3571 Atlantic Ave
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/parcels", methods=["GET"])
+async def parcels_page(request: Request) -> JSONResponse:
+    """Same lookup and cleaning as lookup_parcel, shown in the browser as JSON."""
+    address = request.query_params.get("address", "")
+    if not address.strip():
+        return JSONResponse(
+            {"message": "Add an address to the link, like /parcels?address=3571 Atlantic Ave"}
+        )
+
+    # The database call is slow-ish, so run it off the web server's main loop.
+    matches = await anyio.to_thread.run_sync(find_by_address, address)
+    if not matches:
+        # A normal (200) response with a plain message, not an error page.
+        return JSONResponse({"message": f"No parcel found for {address.strip()!r}."})
+    return JSONResponse(matches[0] if len(matches) == 1 else matches)
+
+
 if __name__ == "__main__":
-    mcp.run()
+    if "--http" in sys.argv:
+        mcp.run("streamable-http", port=int(os.environ.get("PORT", "8000")))
+    else:
+        mcp.run()
