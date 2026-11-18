@@ -26,8 +26,9 @@ Rule: before comparing, clean BOTH the typed address and the stored address the 
 2. Trim spaces off the ends
 3. Collapse double spaces into one
 4. Shorten street words: ROAD→RD, STREET→ST, AVENUE→AVE, BOULEVARD→BLVD, DRIVE→DR, LANE→LN
+5. Remove punctuation (periods, commas)
 
 Storage: keep site_address exactly as the county wrote it, and add a second column,
 address_key, holding the cleaned version. Lookups match against address_key.
 
-Not handled: typos ("Buk Jones"), missing house numbers, unit/apartment numbers.
+
