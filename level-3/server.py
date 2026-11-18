@@ -6,41 +6,43 @@ Four tools (the four questions from the dataset README):
 - last_sale: when one address last sold, and for how much
 - count_by_land_use_and_zip: how many parcels of one land use are in one zip code
 
-One plain web page:
+Two plain web pages:
+- /                                    -> status page: says the service is running
 - /parcels?address=3571 Atlantic Ave  -> that parcel's record, same lookup as lookup_parcel
 
-Setup: put DATABASE_URL=... in level-3/.env (never commit it). load_parcels.py
-must have been run first so the parcels table exists.
+Setup: the database password comes ONLY from the environment variable
+DATABASE_URL (never from a file). On the host, set it in the dashboard. Locally,
+in PowerShell:  $env:DATABASE_URL = "postgresql://..."
+load_parcels.py must have been run first so the parcels table exists.
 
 Run:
     python server.py          # for Claude Desktop (stdio). Tools only.
-    python server.py --http   # web server on http://127.0.0.1:8000
-                              #   tools at /mcp, web page at /parcels?address=...
+    python server.py --http   # web server on 0.0.0.0, port $PORT (8000 if unset)
+                              #   status at /, tools at /mcp, web page at /parcels?address=...
 """
 
 import os
 import sys
-from pathlib import Path
 
 import anyio
 import psycopg
-from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 # The exact same cleaning rule the loader used to build address_key.
 # Importing it (instead of copying it) means the two can never drift apart.
 from load_parcels import make_address_key
 
-HERE = Path(__file__).parent
-
-# The password lives only in level-3/.env, never in this file.
-load_dotenv(HERE / ".env")
+# The password comes only from the DATABASE_URL environment variable,
+# never from this file or any other file.
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    sys.exit("DATABASE_URL is not set. Add it to level-3/.env (see load_parcels.py).")
+    sys.exit(
+        "DATABASE_URL is not set. Set it as an environment variable "
+        "(on the host: in its dashboard; locally: $env:DATABASE_URL = \"postgresql://...\")."
+    )
 
 NO_MATCH = "No parcel found for that address. Check the spelling or try a shorter version."
 
@@ -247,6 +249,38 @@ def count_by_land_use_and_zip(land_use: str, zip_code: str) -> dict | str:
 
 
 # ---------------------------------------------------------------------------
+# Status page: /
+# ---------------------------------------------------------------------------
+
+STATUS_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wake Parcels</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+    code { background: #f2f2f2; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Wake Parcels</h1>
+  <p>&#9989; The service is running.</p>
+  <p>Look up a Wake County parcel by address. Try this example:</p>
+  <p><a href="/parcels?address=3571%20Atlantic%20Ave">/parcels?address=3571 Atlantic Ave</a></p>
+  <p>To look up another address, change the part after <code>address=</code>.</p>
+</body>
+</html>
+"""
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def status_page(request: Request) -> HTMLResponse:
+    """Simple page so you (and the host's health check) can see the service is up."""
+    return HTMLResponse(STATUS_PAGE)
+
+
+# ---------------------------------------------------------------------------
 # Plain web page: /parcels?address=3571 Atlantic Ave
 # ---------------------------------------------------------------------------
 
@@ -269,6 +303,8 @@ async def parcels_page(request: Request) -> JSONResponse:
 
 if __name__ == "__main__":
     if "--http" in sys.argv:
-        mcp.run("streamable-http", port=int(os.environ.get("PORT", "8000")))
+        # The host tells us which port to use through PORT. 0.0.0.0 means
+        # "accept connections from outside this machine", which a host needs.
+        mcp.run("streamable-http", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
     else:
         mcp.run()

@@ -1,0 +1,7 @@
+# Packages server.py needs (load_parcels.py, which server.py imports, uses the same ones).
+mcp==2.3.0
+psycopg[binary]==3.3.9
+python-dotenv==1.2.4
+anyio==4.16.0
+starlette==1.10.0
+uvicorn==0.54.0
