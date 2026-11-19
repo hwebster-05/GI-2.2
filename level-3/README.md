@@ -4,7 +4,7 @@ A web page and API for looking up Wake County, NC parcel records by street addre
 Type an address and get the parcel's record: owner, acreage, zoning, land use,
 assessed value and last sale.
 
-**Live site:** https://YOUR-RENDER-URL.onrender.com
+**Live site:** https://wake-parcels.onrender.com
 (Free hosting: the first visit after 15 idle minutes can take about a minute to load.)
 
 ## How it works
