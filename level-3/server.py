@@ -271,6 +271,7 @@ STATUS_PAGE = """<!doctype html>
     <input id="address" name="address" placeholder="3571 Atlantic Ave" required>
     <button type="submit">Look up</button>
   </form>
+    <p><small>Data: a sample of Wake County parcel records.</small></p>
 </body>
 </html>
 """
