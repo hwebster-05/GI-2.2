@@ -266,9 +266,11 @@ STATUS_PAGE = """<!doctype html>
 <body>
   <h1>Wake Parcels</h1>
   <p>&#9989; The service is running.</p>
-  <p>Look up a Wake County parcel by address. Try this example:</p>
-  <p><a href="/parcels?address=3571%20Atlantic%20Ave">/parcels?address=3571 Atlantic Ave</a></p>
-  <p>To look up another address, change the part after <code>address=</code>.</p>
+   <form action="/parcels" method="get">
+    <label for="address">Look up a Wake County parcel by address:</label><br>
+    <input id="address" name="address" placeholder="3571 Atlantic Ave" required>
+    <button type="submit">Look up</button>
+  </form>
 </body>
 </html>
 """
